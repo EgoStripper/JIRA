@@ -1,95 +1,80 @@
-# ===========================================
-# Export Jira Users (Active & Inactive) with License Info and Last Login
-# Compatible with Jira Data Center using Crowd
-# Author: ChatGPT (PowerShell Guru Mode)
-# ===========================================
+<#
+.SYNOPSIS
+    Builds a flattened org chart from a list of users by recursively retrieving each user’s manager chain.
 
-# ========== CONFIGURATION ==========
-$JiraBaseUrl    = "https://your-jira-url.com"  # CHANGE ME
-$Username       = "jira_admin"                 # CHANGE ME
-$ApiToken       = "your_api_token_or_password" # CHANGE ME
-$OutputFile     = "C:\Temp\users.csv"
-$BatchSize      = 100                          # Jira pagination limit
+.DESCRIPTION
+    For each user in the input file, retrieves their full management chain until it ends or loops.
+    Outputs one row per user with each manager in a separate column.
 
-# ========== AUTH ==========
-$base64AuthInfo = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$Username:$ApiToken"))
-$headers = @{
-    Authorization = "Basic $base64AuthInfo"
-    Accept        = "application/json"
+.NOTES
+    Author: YourName
+    Date: 2025-04-16
+#>
+
+# Import Active Directory module
+Import-Module ActiveDirectory -ErrorAction Stop
+
+# Set input and output file paths
+$inputFile = "C:\temp\users.txt"
+$outputFile = "C:\temp\OrgChart.csv"
+
+# Check if input file exists
+if (-not (Test-Path -Path $inputFile)) {
+    Write-Error "Input file not found: $inputFile"
+    exit 1
 }
 
-# ========== FUNCTION ==========
-function Get-AllJiraUsers {
-    $startAt = 0
-    $allUsers = @()
+# Read list of user IDs
+$userIDs = Get-Content $inputFile | Where-Object { $_.Trim() -ne "" }
 
-    Write-Host "Fetching active and inactive users from Jira..." -ForegroundColor Cyan
+# Store all results
+$results = @()
 
-    do {
-        $url = "$JiraBaseUrl/rest/api/2/user/search?startAt=$startAt&maxResults=$BatchSize&includeInactive=true&username=%"
+foreach ($userID in $userIDs) {
+    try {
+        $chain = @{}
+        $visited = @{}
 
-        try {
-            $response = Invoke-RestMethod -Uri $url -Headers $headers -Method Get -ErrorAction Stop
+        # Get starting user
+        $user = Get-ADUser -Identity $userID -Properties DisplayName, Manager -ErrorAction Stop
+        $level = 0
+        $originalUser = $user
 
-            foreach ($user in $response) {
-                # Get user details
-                $userUrl = "$JiraBaseUrl/rest/api/2/user?username=$($user.name)"
-                $userDetail = Invoke-RestMethod -Uri $userUrl -Headers $headers -Method Get -ErrorAction Stop
+        # Add the starting user as Level0
+        $chain["Level$level"] = $user.DisplayName
+        $visited[$user.DistinguishedName] = $true
 
-                $groupList = @()
-                if ($userDetail.groups.items) {
-                    $groupList = $userDetail.groups.items | ForEach-Object { $_.name }
-                }
+        # Traverse up the manager chain
+        while ($user.Manager) {
+            $manager = Get-ADUser -Identity $user.Manager -Properties DisplayName, Manager -ErrorAction Stop
 
-                # Guess license type based on group membership (may vary per org setup)
-                $licenseType = if ($groupList -match "jira-software-users") {
-                    "Jira Software"
-                } elseif ($groupList -match "jira-servicedesk-users") {
-                    "Jira Service Management"
-                } elseif ($groupList -match "jira-core-users") {
-                    "Jira Core"
-                } else {
-                    "Unlicensed or Custom"
-                }
-
-                $lastLogin = if ($userDetail."active") {
-                    $userDetail."lastLogin"  # May be null if Crowd is not syncing login info
-                } else {
-                    "Inactive"
-                }
-
-                $allUsers += [PSCustomObject]@{
-                    Username      = $user.name
-                    DisplayName   = $user.displayName
-                    Email         = $user.emailAddress
-                    Active        = $user.active
-                    License       = $licenseType
-                    Groups        = $groupList -join ", "
-                    LastLogin     = if ($lastLogin) { $lastLogin } else { "Unknown" }
-                }
+            if ($visited.ContainsKey($manager.DistinguishedName)) {
+                Write-Warning "Detected loop in manager chain for user: $userID"
+                break
             }
 
-            $startAt += $response.Count
-        } catch {
-            Write-Error "Error fetching users: $_"
-            break
+            $level++
+            $chain["Level$level"] = $manager.DisplayName
+            $visited[$manager.DistinguishedName] = $true
+
+            $user = $manager
         }
 
-    } while ($response.Count -ge $BatchSize)
+        # Add UserID to the beginning
+        $chain["UserID"] = $originalUser.SamAccountName
 
-    return $allUsers
+        # Append to results
+        $results += New-Object PSObject -Property $chain
+
+    } catch {
+        Write-Warning "Error processing user '$userID': $_"
+    }
 }
 
-# ========== EXECUTION ==========
+# Export result to CSV
 try {
-    $users = Get-AllJiraUsers
-
-    if ($users.Count -eq 0) {
-        Write-Warning "No users retrieved!"
-    } else {
-        $users | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
-        Write-Host "✅ Export complete. File saved to: $OutputFile" -ForegroundColor Green
-    }
+    $results | Export-Csv -Path $outputFile -NoTypeInformation -Encoding UTF8
+    Write-Host "Org chart successfully exported to $outputFile"
 } catch {
-    Write-Error "❌ Script execution failed: $_"
+    Write-Error "Failed to export CSV: $_"
 }
